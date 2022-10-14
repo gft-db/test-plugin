@@ -1,0 +1,150 @@
+name: piRo
+
+on:
+  push:
+    branches:
+      - piRo
+    paths:
+      - .version_id
+
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  update_plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - id: checkout
+        name: Checkout Local Repo
+        uses: actions/checkout@v3
+        with:
+          ref: main
+
+      - id: check
+        name: Check for Existing PRs
+        run: |
+          list=$(gh pr list | grep update/plugin/ || true)
+          echo -e "PR List:\n$list"
+
+          if [ -n "$list" ]; then
+            pr_num=$(gh pr list --json number,headRefName -q '.[0] | select(.headRefName | startswith("update/plugin/"))' | jq '.number')
+            echo "Setting pr_num #$pr_num"
+            echo "pr_num=$pr_num" >> $GITHUB_ENV
+          fi
+
+      - id: sync
+        name: Sync with piRo
+        env:
+          BRANCH: update/plugin/${{ github.run_number }}-${{ github.run_attempt }}
+        run: |
+          # setup our user
+          git config --global user.name "piRo"
+          git config --global user.email "piRo@users.noreply.github.com"
+
+          # fetch piRo branch
+          git fetch origin piRo
+          git checkout -b piRo origin/piRo
+
+          # find piRo deleted files
+          declare -A deleted=()
+          for x in $(git log --diff-filter=D --pretty="format:" --name-only | sed '/^[[:space:]]*$/d'); do 
+            if [ ! -f "$x" ]; then
+              deleted[$x]=1;
+            fi;
+          done
+          echo deleted: ${!deleted[@]}
+          
+          if [ -n "$pr_num" ]; then
+            echo "Checking out existing PR number #$pr_num"
+            gh pr checkout $pr_num
+            if [ -n "$(gh pr view --json files --jq '.files[].path' | grep -E -v '\.github/workflows|\.md$|^\.version_id$')" ]; then
+               operative_changes="Y"
+               echo "Found operative_changes in existing PR"
+             else
+               operative_changes="N"
+               echo "No operative_changes in existing PR"
+             fi
+          else
+            echo "create the branch $BRANCH"
+            git checkout -b $BRANCH main
+          fi
+
+          git merge piRo --allow-unrelated-histories --squash -s recursive -X theirs
+          
+          # try apply piRo deletions
+          for x in ${!deleted[@]}; do 
+            git rm $x --ignore-unmatch
+          done
+
+          # check the merge status
+          status=$(git status -s)
+          echo -e "Merge Status:\n$status"
+
+          # commit the merge
+          if [ -n "$status" ]; then
+            git commit -q -m "$(git log piRo -n 1 --pretty=format:%s)"
+            
+            # push our branch
+            if [ -n "$pr_num" ]; then
+              git push -q
+              echo "Merged changes pushed"
+            else
+              git push -q --set-upstream origin $BRANCH
+              echo "Changes pushed"
+            fi
+
+            echo "new_changes=Y" >> $GITHUB_ENV
+          fi
+          
+          echo "operative_changes=$operative_changes" >> $GITHUB_ENV
+          
+      - id: raise
+        name: Open PR
+        if: ${{ env.new_changes == 'Y' }}
+        env:
+          PIRO_LABEL: "piRo :fire::robot:"
+          PR_LABEL: "update plugin"
+        run: |
+          # create the labels
+          gh label create "$PIRO_LABEL" -c CE2029 -d "PR Robot" >> /dev/null 2>&1 || true
+          sleep 1  # Avoid the dreaded "submitted too quickly" error
+          gh label create "$PR_LABEL" -c CBDF2B -d "Update plugin files" >> /dev/null 2>&1 || true
+
+          # create a PR
+          TITLE="Update plugin to $(git log piRo -n 1 --pretty=format:%s)"
+          if [ -z "$pr_num" ]; then
+            echo "New PR, create it and label it"
+            gh pr create -l "$PIRO_LABEL" -l "$PR_LABEL" --title "$TITLE" --body ""
+            pr_num=$(gh pr list --json number,headRefName -q '.[0] | select(.headRefName | startswith("update/plugin/"))' | jq '.number')
+            echo "pr_num=$pr_num" >> $GITHUB_ENV
+          else
+            echo "Not a new PR so just udpate the title"
+            gh pr edit --title "$TITLE" --body ""
+          fi
+
+          if [ -n "$(gh pr view --json files --jq '.files[].path' | grep -E -v '\.github/workflows|\.md$|^\.version_id$')" ]; then
+            operative_changes="Y"
+            echo "Found operative_changes in new PR"
+          else
+            operative_changes="N"
+            echo "No operative_changes in new PR"
+          fi
+
+          echo "operative_changes=$operative_changes" >> $GITHUB_ENV
+
+      - id: merge
+        name: Merge PR
+        if: ${{ env.operative_changes == 'N' }}
+        run: |
+          TITLE=$(gh pr view $pr_num --json title | jq -r '.title')
+          gh pr merge $pr_num --admin -s -t "$TITLE (#$pr_num)" -b ""
+          echo "PR #$pr_num successfully merged"
+          
